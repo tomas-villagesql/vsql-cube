@@ -187,6 +187,28 @@ id
 3
 COMMIT;
 #
+# A locking read waits for a transaction that moved a row away and back
+# several times. Several index entries for that row then look current
+# to validate(); the row must still be returned once.
+#
+CREATE TABLE tl (id INT PRIMARY KEY, c `cube`(2) NOT NULL);
+CREATE INDEX idx_c ON tl (c) USING EXTENDED(vsql_cube.rtree);
+INSERT INTO tl VALUES (1, '(1,1)'), (2, '(2,2)'), (3, '(3,3)');
+BEGIN;
+UPDATE tl SET c = '(5,5)' WHERE id = 1;
+UPDATE tl SET c = '(1,1)' WHERE id = 1;
+UPDATE tl SET c = '(5,5)' WHERE id = 1;
+BEGIN;
+SELECT id FROM tl ORDER BY cube_distance(c, '(0,0)') LIMIT 10 FOR SHARE;
+COMMIT;
+# Expected: 2, 3, 1, each once
+id
+2
+3
+1
+COMMIT;
+DROP TABLE tl;
+#
 # MVCC: a snapshot keeps seeing the rows as they were
 #
 START TRANSACTION WITH CONSISTENT SNAPSHOT;

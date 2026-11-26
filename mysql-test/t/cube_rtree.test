@@ -170,6 +170,40 @@ SELECT id FROM t ORDER BY cube_distance(c, '(0,0)') LIMIT 2 FOR UPDATE;
 COMMIT;
 
 --echo #
+--echo # A locking read waits for a transaction that moved a row away and back
+--echo # several times. Several index entries for that row then look current
+--echo # to validate(); the row must still be returned once.
+--echo #
+
+CREATE TABLE tl (id INT PRIMARY KEY, c `cube`(2) NOT NULL);
+CREATE INDEX idx_c ON tl (c) USING EXTENDED(vsql_cube.rtree);
+INSERT INTO tl VALUES (1, '(1,1)'), (2, '(2,2)'), (3, '(3,3)');
+
+--connect (con_mover, localhost, root,,)
+BEGIN;
+UPDATE tl SET c = '(5,5)' WHERE id = 1;
+UPDATE tl SET c = '(1,1)' WHERE id = 1;
+UPDATE tl SET c = '(5,5)' WHERE id = 1;
+
+--connection default
+BEGIN;
+--send SELECT id FROM tl ORDER BY cube_distance(c, '(0,0)') LIMIT 10 FOR SHARE
+
+--connection con_mover
+let $wait_condition =
+  SELECT COUNT(*) = 1 FROM information_schema.innodb_trx
+  WHERE trx_state = 'LOCK WAIT';
+--source include/wait_condition.inc
+COMMIT;
+
+--connection default
+--echo # Expected: 2, 3, 1, each once
+--reap
+COMMIT;
+--disconnect con_mover
+DROP TABLE tl;
+
+--echo #
 --echo # MVCC: a snapshot keeps seeing the rows as they were
 --echo #
 

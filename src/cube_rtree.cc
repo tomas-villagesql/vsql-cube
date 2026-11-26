@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -895,6 +896,15 @@ struct Cursor {
   // Last result of the previous batch; the next batch starts after it.
   bool has_last = false;
   Hit last;
+  // Number of hits in the batches before this one, so batch_start + pos
+  // numbers every hit of the scan.
+  uint64_t batch_start = 0;
+  // Locking reads: the hit that validate() first accepted for each primary
+  // key (keyed by the key's bytes in the entry). Several entries of one row
+  // can pass validate(): entries left by a transaction that changed the row
+  // to the same value more than once look identical to it. Only the first
+  // may return the row.
+  std::map<Bytes, uint64_t> validated;
 };
 
 bool entry_visible(const Cursor &c, TrxRef ins_trx, TrxRef del_trx) {
@@ -934,6 +944,7 @@ bool refill(Cursor &c, char *err, uint32_t err_len) {
   std::vector<Item> queue;
   queue.push_back(Item{0.0, false, c.rt->root_page, 0});
 
+  c.batch_start += c.hits.size();
   c.hits.clear();
   c.pos = 0;
   while (!queue.empty() && c.hits.size() < c.batch) {
@@ -1269,7 +1280,7 @@ bool fetch(Index::Cursor cursor, IndexScanKey::KeyPartRef * /*key_ref*/,
 
 bool validate(Index::Cursor cursor, Segment::TrxRef trx_ref, bool *valid,
               char *err, uint32_t err_len) {
-  const auto *c = static_cast<const Cursor *>(cursor);
+  auto *c = static_cast<Cursor *>(cursor);
   *valid = false;
   if (c->pos >= c->hits.size())
     return fail(err, err_len, "validate past the end of the scan");
@@ -1278,13 +1289,29 @@ bool validate(Index::Cursor cursor, Segment::TrxRef trx_ref, bool *valid,
   if (!leaf_entry_box(c->rt->geo, probe.data(), box))
     return fail(err, err_len, "invalid cube value");
 
-  std::shared_lock<std::shared_mutex> lock(c->rt->mutex);
-  Page::Ref page = Page::INVALID_REF;
-  uint32_t slot = 0;
-  return find_entry(
-      *c->rt, probe, box,
-      [trx_ref](TrxRef ins, TrxRef del) { return ins == trx_ref && del == 0; },
-      &page, &slot, valid, err, err_len);
+  {
+    std::shared_lock<std::shared_mutex> lock(c->rt->mutex);
+    Page::Ref page = Page::INVALID_REF;
+    uint32_t slot = 0;
+    if (find_entry(
+            *c->rt, probe, box,
+            [trx_ref](TrxRef ins, TrxRef del) {
+              return ins == trx_ref && del == 0;
+            },
+            &page, &slot, valid, err, err_len)) {
+      return true;
+    }
+  }
+  if (!*valid) return false;
+
+  // The row is current; return it only from the first hit that validated
+  // it. The same hit may be validated again (after a lock wait).
+  const uint64_t hit = c->batch_start + c->pos;
+  const size_t pk = kLeafKey + size_t{c->rt->geo.key_len};
+  const auto [it, inserted] =
+      c->validated.emplace(Bytes(probe.begin() + pk, probe.end()), hit);
+  if (!inserted && it->second != hit) *valid = false;
+  return false;
 }
 
 bool save(Index::Cursor /*cursor*/, char * /*err*/, uint32_t /*err_len*/) {
