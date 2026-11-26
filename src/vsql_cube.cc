@@ -603,6 +603,18 @@ static void set_cube_result_typed(const CubeData &c,
     out.error(msg);
     return;
   }
+  // Input parsing rejects NaN and infinity; arithmetic such as cube_enlarge
+  // can still overflow to them, so results are checked here as well.
+  const bool is_point = (c.flags & kFlagIsPoint) != 0;
+  for (int i = 0; i < c.ndim; i++) {
+    if (!std::isfinite(c.ll[i]) || (!is_point && !std::isfinite(c.ur[i]))) {
+      char msg[VEF_MAX_ERROR_LEN];
+      snprintf(msg, sizeof(msg),
+               "cube: coordinate %d of the result is not finite", i + 1);
+      out.error(msg);
+      return;
+    }
+  }
   size_t buf_size = 8 + 2 * static_cast<size_t>(n_slots) * sizeof(double);
   auto buf = out.buffer();
   cube_to_buf(&c, buf.data(), n_slots);
